@@ -51,6 +51,7 @@ use crate::pattern::julia_set::JuliaSet;
 use crate::pattern::pulse::Pulse;
 use crate::pattern::smpte::SmpteBars;
 
+use crate::media_source::{FillOutcome, MediaSource};
 use v4l2r::PixelFormat;
 use v4l2r::QueueType;
 use v4l2r::bindings;
@@ -155,13 +156,14 @@ pub enum TestPattern {
     Pulse = 0,
     SmpteBars = 1,
     JuliaSet = 2,
+    MediaFile = 3,
 }
 
 impl TestPattern {
     /// Lowest menu index, reported as `minimum` for `V4L2_CID_TEST_PATTERN`.
     const MIN: i32 = TestPattern::Pulse as i32;
     /// Highest menu index, reported as `maximum` for `V4L2_CID_TEST_PATTERN`.
-    const MAX: i32 = TestPattern::JuliaSet as i32;
+    const MAX: i32 = TestPattern::MediaFile as i32;
     /// Pattern selected until the guest asks for something else.
     const DEFAULT: TestPattern = TestPattern::Pulse;
 
@@ -171,6 +173,7 @@ impl TestPattern {
             TestPattern::Pulse => "Pulse",
             TestPattern::SmpteBars => "SMPTE + Bouncing Box",
             TestPattern::JuliaSet => "Animated Julia Set",
+            TestPattern::MediaFile => "Host Media File",
         }
     }
 
@@ -180,6 +183,7 @@ impl TestPattern {
             TestPattern::Pulse => &Pulse,
             TestPattern::SmpteBars => &SmpteBars,
             TestPattern::JuliaSet => &JuliaSet,
+            TestPattern::MediaFile => panic!("MediaFile has no static generator"),
         }
     }
 }
@@ -193,6 +197,7 @@ impl TryFrom<i32> for TestPattern {
             0 => Ok(TestPattern::Pulse),
             1 => Ok(TestPattern::SmpteBars),
             2 => Ok(TestPattern::JuliaSet),
+            3 => Ok(TestPattern::MediaFile),
             _ => Err(libc::ERANGE),
         }
     }
@@ -327,6 +332,8 @@ pub struct DeviceSharedState<Q: VirtioMediaEventQueue> {
     width: u32,
     /// Height of the video.
     height: u32,
+    /// Optional host video file media source.
+    media: Option<MediaSource>,
 }
 
 /// Shared session state between ioctl handlers and the background frame worker.
@@ -594,7 +601,33 @@ fn spawn_frame_worker<Q: VirtioMediaEventQueue + Send + 'static>(
 
             // Release the lock during pattern rendering:
             if let (Some(mut fy), Some(mut fu), Some(mut fv)) = (file_y, file_u, file_v) {
-                if let Err(e) = EmulatedCameraSession::write_pattern(
+                if controls.test_pattern == TestPattern::MediaFile {
+                    let mut dev = device_state.lock().unwrap();
+                    if let Some(ref mut m) = dev.media {
+                        m.ensure_started();
+                    }
+                    let outcome = match dev.media {
+                        Some(ref m) => m.fill(&mut fy, &mut fu, &mut fv),
+                        None => Ok(FillOutcome::NoFrame),
+                    };
+                    match outcome {
+                        Ok(FillOutcome::Live) | Ok(FillOutcome::Frozen) => {}
+                        _ => {
+                            if let Err(e) = EmulatedCameraSession::write_pattern(
+                                iteration,
+                                TestPattern::Pulse,
+                                &controls,
+                                width,
+                                height,
+                                &mut fy,
+                                &mut fu,
+                                &mut fv,
+                            ) {
+                                send_warn(format!("Failed to write pattern: errno {}", e));
+                            }
+                        }
+                    }
+                } else if let Err(e) = EmulatedCameraSession::write_pattern(
                     iteration,
                     controls.test_pattern,
                     &controls,
@@ -663,15 +696,30 @@ where
     Q: VirtioMediaEventQueue + Send + 'static,
     HM: VirtioMediaHostMemoryMapper,
 {
-    pub fn new(evt_queue: Q, mapper: HM, lens_facing: LensFacing) -> Self {
+    pub fn new(
+        evt_queue: Q,
+        mapper: HM,
+        lens_facing: LensFacing,
+        media_file: Option<std::path::PathBuf>,
+        ffmpeg_path: std::path::PathBuf,
+    ) -> Self {
+        let media = media_file.map(|path| MediaSource::new(path, ffmpeg_path));
+        let default_pattern = if media.is_some() {
+            TestPattern::MediaFile
+        } else {
+            TestPattern::Pulse
+        };
+        let mut controls = CameraControls::new(lens_facing);
+        controls.test_pattern = default_pattern;
         Self {
             mmap_manager: MmapMappingManager::from(mapper),
             active_session: None,
             device_state: Arc::new(Mutex::new(DeviceSharedState {
                 evt_queue,
-                controls: CameraControls::new(lens_facing),
+                controls,
                 width: WIDTH,
                 height: HEIGHT,
+                media,
             })),
         }
     }
@@ -758,13 +806,21 @@ where
         }
     }
 
+    pub fn pattern_max(&self) -> i32 {
+        if self.device_state.lock().unwrap().media.is_some() {
+            4
+        } else {
+            3
+        }
+    }
+
     fn test_pattern_query_ext_ctrl(&self) -> bindings::v4l2_query_ext_ctrl {
         bindings::v4l2_query_ext_ctrl {
             id: bindings::V4L2_CID_TEST_PATTERN,
             type_: bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_MENU,
             name: ctrl_name("Test Pattern").map(|b| b as i8),
             minimum: TestPattern::MIN as i64,
-            maximum: TestPattern::MAX as i64,
+            maximum: self.pattern_max() as i64,
             step: 1,
             default_value: TestPattern::DEFAULT as i64,
             flags: 0,
@@ -1518,6 +1574,9 @@ where
         index: u32,
     ) -> IoctlResult<bindings::v4l2_querymenu> {
         if id != bindings::V4L2_CID_TEST_PATTERN {
+            return Err(libc::EINVAL);
+        }
+        if index > self.pattern_max() as u32 {
             return Err(libc::EINVAL);
         }
         // Menu indices are the `TestPattern` discriminants, so the enum decides the range.

@@ -14,6 +14,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use clap::Parser;
 use log::error;
@@ -24,8 +25,11 @@ use virtio_media::protocol::VirtioMediaDeviceConfig;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 
 mod device;
-mod pattern;
 use device::LensFacing;
+
+mod media_source;
+
+pub mod pattern;
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
@@ -35,6 +39,8 @@ pub(crate) enum Error {
     CouldNotCreateDaemon(vhost_user_backend::Error),
     #[error("Fatal error: {0}")]
     ServeFailed(vhost_user_backend::Error),
+    #[error("Media file is unavailable: {0}")]
+    MediaUnavailable(String),
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -51,12 +57,30 @@ struct CmdLineArgs {
     /// Lens facing configuration: FRONT, BACK, or EXTERNAL.
     #[clap(long, value_name = "LENS_FACING", default_value = "EXTERNAL")]
     lens_facing: String,
+    /// Host media file (video, e.g. .mp4, or still image, e.g. .jpg) to stream as the
+    /// camera feed.
+    #[clap(long, value_name = "FILE")]
+    media_file: Option<PathBuf>,
+    /// Path to the ffmpeg binary (default: resolve "ffmpeg" from PATH).
+    #[clap(long, value_name = "BIN", default_value = "ffmpeg")]
+    ffmpeg_path: PathBuf,
+    /// Fail startup instead of degrading to test patterns when --media-file cannot be
+    /// used (missing ffmpeg, unreadable/undecodable file). For CI/lab use.
+    #[clap(long)]
+    require_media: bool,
+    /// Timeout in seconds for the strict-mode startup decode probe.
+    #[clap(long, value_name = "SECS", default_value_t = 5)]
+    media_probe_timeout: u64,
 }
 
 #[derive(PartialEq, Debug)]
 struct Config {
     socket_path: PathBuf,
     lens_facing: LensFacing,
+    media_file: Option<PathBuf>,
+    ffmpeg_path: PathBuf,
+    require_media: bool,
+    media_probe_timeout: u64,
 }
 
 impl TryFrom<CmdLineArgs> for Config {
@@ -70,6 +94,10 @@ impl TryFrom<CmdLineArgs> for Config {
         Ok(Config {
             socket_path: args.socket_path,
             lens_facing,
+            media_file: args.media_file,
+            ffmpeg_path: args.ffmpeg_path,
+            require_media: args.require_media,
+            media_probe_timeout: args.media_probe_timeout,
         })
     }
 }
@@ -89,6 +117,36 @@ fn start_backend(config: Config) -> Result<()> {
     let mut card = [0u8; 32];
     let card_name = "emulated_camera";
     card[0..card_name.len()].copy_from_slice(card_name.as_bytes());
+
+    // Resolve startup/graceful decline on the media file ONCE before the serve loop
+    let media_file = match config.media_file.as_ref() {
+        None => None,
+        Some(path) => match media_source::MediaSource::check_cheap(path, &config.ffmpeg_path) {
+            Err(reason) if config.require_media => {
+                return Err(Error::MediaUnavailable(reason));
+            }
+            Err(reason) => {
+                log::warn!(
+                    "--media-file {} is unusable: {}; camera will run with synthetic test patterns only",
+                    path.display(),
+                    reason
+                );
+                None
+            }
+            Ok(()) => {
+                if config.require_media {
+                    let timeout = Duration::from_secs(config.media_probe_timeout);
+                    if let Err(reason) =
+                        media_source::MediaSource::probe_decode(path, &config.ffmpeg_path, timeout)
+                    {
+                        return Err(Error::MediaUnavailable(reason));
+                    }
+                }
+                Some(path.clone())
+            }
+        },
+    };
+
     // When the main vm shuts down, the damon exits gracefully. Using an infinite loop to work
     // across VMs restarts rather than having to manually start the binary again.
     loop {
@@ -99,10 +157,19 @@ fn start_backend(config: Config) -> Result<()> {
             card,
         };
         let lens_facing = config.lens_facing;
+        let ffmpeg_path = config.ffmpeg_path.clone();
+        let media_file_clone = media_file.clone();
+
         let backend = Arc::new(RwLock::new(VhuMediaBackend::new(
             device_config,
             move |event_queue, host_mapper| {
-                crate::device::EmulatedCamera::new(event_queue, host_mapper, lens_facing)
+                crate::device::EmulatedCamera::new(
+                    event_queue,
+                    host_mapper,
+                    lens_facing,
+                    media_file_clone.clone(),
+                    ffmpeg_path.clone(),
+                )
             },
         )));
         let mut daemon = VhostUserDaemon::new(

@@ -200,8 +200,25 @@ impl EventQueue {
 
 impl VirtioMediaEventQueue for EventQueue {
     fn send_event(&mut self, event: V4l2Event) {
-        if let Err(e) = self.send_events(event) {
-            error!("send event failed with error: {e}");
+        let mut retries = 0;
+        let event = std::mem::ManuallyDrop::new(event);
+        loop {
+            // SAFETY: `V4l2Event` is composed exclusively of Plain Old Data (POD) Linux uapi kernel
+            // structs (`v4l2_buffer` and `v4l2_event`) with zero heap allocations and zero `Drop`
+            // implementations. Even though bindgen C unions prevent `Clone` derivation, bitwise
+            // copying via `std::ptr::read` is memory-safe across retry loops without double-free risks.
+            let ev = unsafe { std::ptr::read(&*event as *const V4l2Event) };
+            match self.send_events(ev) {
+                Ok(_) => break,
+                Err(VhuMediaBackendError::DescriptorUnavailable) if retries < 50 => {
+                    retries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => {
+                    error!("send event failed with error: {e}");
+                    break;
+                }
+            }
         }
     }
 }
