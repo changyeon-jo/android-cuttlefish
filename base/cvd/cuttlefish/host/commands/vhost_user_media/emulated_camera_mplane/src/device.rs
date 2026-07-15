@@ -14,6 +14,24 @@
 
 use anyhow::{Context, Result as AnyhowResult};
 use std::collections::VecDeque;
+use std::sync::OnceLock;
+use std::time::Instant;
+
+static START_TIME: OnceLock<Instant> = OnceLock::new();
+
+/// Estimated warmup latency (2600 ms) from host backend startup (`init_start_time`)
+/// to the first queued buffer from the Android guest camera HAL. Subtracting this offset
+/// aligns presentation timestamps close to zero at stream begin, preventing timestamp
+/// drift or frame drops in guest video recorders.
+const CAMERA_BOOT_WARMUP_LATENCY_MS: u64 = 2600;
+
+pub fn init_start_time() {
+    let _ = START_TIME.set(Instant::now());
+}
+
+fn get_start_time() -> Instant {
+    *START_TIME.get_or_init(Instant::now)
+}
 use std::io::Result as IoResult;
 use std::io::Seek;
 use std::io::SeekFrom;
@@ -281,17 +299,15 @@ impl Buffer {
                     }
                 }
                 self.v4l2_buffer.set_sequence(sequence);
-                let mut ts = libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                };
-                // SAFETY: clock_gettime is a standard POSIX libc call with a valid pointer.
-                unsafe {
-                    libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
-                }
+                let elapsed =
+                    get_start_time()
+                        .elapsed()
+                        .saturating_sub(std::time::Duration::from_millis(
+                            CAMERA_BOOT_WARMUP_LATENCY_MS,
+                        ));
                 self.v4l2_buffer.set_timestamp(bindings::timeval {
-                    tv_sec: ts.tv_sec as bindings::__time_t,
-                    tv_usec: (ts.tv_nsec / 1000) as bindings::__time_t,
+                    tv_sec: elapsed.as_secs() as bindings::__time_t,
+                    tv_usec: elapsed.subsec_micros() as bindings::__time_t,
                 });
                 flags &= !BufferFlags::QUEUED;
             }

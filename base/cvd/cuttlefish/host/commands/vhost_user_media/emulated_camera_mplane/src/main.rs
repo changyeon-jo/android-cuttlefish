@@ -118,6 +118,7 @@ fn start_backend(config: Config) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    crate::device::init_start_time();
     let args = CmdLineArgs::parse();
 
     init_logging(args.verbosity)?;
