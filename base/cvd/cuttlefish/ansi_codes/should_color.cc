@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 The Android Open Source Project
+ * Copyright (C) 2026 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,25 +14,31 @@
  * limitations under the License.
  */
 
-#pragma once
+#include "cuttlefish/ansi_codes/should_color.h"
 
-#include <string>
+#include <unistd.h>
 
-#include "cuttlefish/host/commands/cvd/cli/command_request.h"
-#include "cuttlefish/host/commands/cvd/cli/commands/command_handler.h"
-#include "cuttlefish/result/result.h"
+#include "cuttlefish/common/libs/utils/environment.h"
 
 namespace cuttlefish {
+namespace {
 
-class CvdVersionHandler : public CvdCommandHandler {
- public:
-  CvdVersionHandler() = default;
+bool ColorDefault(int fd) {
+  // https://no-color.org/
+  if (!StringFromEnv("NO_COLOR").value_or("").empty()) {
+    return false;
+  }
+  // https://force-color.org/
+  if (!StringFromEnv("FORCE_COLOR").value_or("").empty()) {
+    return true;
+  }
+  return isatty(fd);
+}
 
-  Result<void> Handle(const CommandRequest& request) override;
-  std::vector<std::string> CmdList() const override;
+}  // namespace
 
-  std::string SummaryHelp() const override;
-  Result<std::string> DetailedHelp(const CommandRequest& request) override;
-};
+bool ShouldColorStdout() { return ColorDefault(STDOUT_FILENO); }
+
+bool ShouldColorStderr() { return ColorDefault(STDERR_FILENO); }
 
 }  // namespace cuttlefish

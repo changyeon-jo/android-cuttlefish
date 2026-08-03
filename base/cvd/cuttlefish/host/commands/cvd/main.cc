@@ -32,6 +32,7 @@
 #include "android-base/file.h"
 #include "fmt/format.h"
 
+#include "cuttlefish/ansi_codes/should_color.h"
 #include "cuttlefish/ansi_codes/terminal_colors.h"
 #include "cuttlefish/common/libs/utils/environment.h"
 #include "cuttlefish/common/libs/utils/files.h"
@@ -59,7 +60,7 @@ namespace {
  *  e.g. cvd start --verbosity=DEBUG
  *
  */
-LogSeverity CvdVerbosityOption(cvd_common::Args& all_args) {
+LogSeverity CvdVerbosityOption(std::vector<std::string>& all_args) {
   std::string verbosity_flag_value;
   std::vector<Flag> verbosity_flag{
       GflagsCompatFlag("verbosity", verbosity_flag_value)};
@@ -124,7 +125,7 @@ void IncreaseFileLimit() {
   }
 }
 
-Result<void> CvdMain(cvd_common::Args all_args) {
+Result<void> CvdMain(std::vector<std::string> all_args) {
   if (!isatty(0)) {
     LOG(INFO) << GetVersionIds().ToString();
   }
@@ -168,7 +169,7 @@ Result<void> CvdMain(cvd_common::Args all_args) {
  * is red.
  */
 std::string ColoredUrl(const std::string& url) {
-  if (!isatty(STDERR_FILENO)) {
+  if (!ShouldColorStderr()) {
     return url;
   }
   std::string coloring_prefix = "\033[01;31m";
@@ -236,7 +237,7 @@ int main(int argc, char** argv) {
     return 0;
   } else if (log_file.has_value() && isatty(2)) {
     VLOG(0) << result.error();
-    cuttlefish::TerminalColors colors(isatty(2));
+    cuttlefish::TerminalColors colors(cuttlefish::ShouldColorStderr());
     std::cerr << colors.Red() << "'cvd' encountered an error." << colors.Reset()
               << " Please see '" << colors.Cyan() << *log_file << colors.Reset()
               << "' for the complete failure report.\n";
